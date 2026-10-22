@@ -1,0 +1,5 @@
+build/
+.DS_Store
+
+# Local investigation notes and hardware identifiers
+Research/
