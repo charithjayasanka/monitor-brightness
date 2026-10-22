@@ -7,3 +7,5 @@ build/DDCTests
 mkdir -p build/module-cache
 swiftc -module-cache-path build/module-cache Sources/ScreenTarget.swift Tests/ScreenTargetTests.swift -framework AppKit -o build/ScreenTargetTests
 build/ScreenTargetTests
+swiftc -module-cache-path build/module-cache Sources/KeyRouting.swift Tests/KeyRoutingTests.swift -framework AppKit -o build/KeyRoutingTests
+build/KeyRoutingTests

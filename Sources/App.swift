@@ -107,6 +107,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var rows: [BrightnessRow] = []
     var generation = 0
     var manualMode = false
+    let brightnessKeys = BrightnessKeys()
+    var keyDeltas: [UInt32: Double] = [:]
+    var keyBusy = false
+    var keyWork: DispatchWorkItem?
+    var keyMessage = "Brightness keys follow the cursor"
+    var keyStatusItem: NSMenuItem?
+    var keysEnabled: Bool { !UserDefaults.standard.bool(forKey: "brightnessKeysDisabled") }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
@@ -117,6 +124,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.delegate = self
         NotificationCenter.default.addObserver(self, selector: #selector(refresh), name: NSApplication.didChangeScreenParametersNotification, object: nil)
         NSWorkspace.shared.notificationCenter.addObserver(self, selector: #selector(refresh), name: NSWorkspace.didWakeNotification, object: nil)
+        brightnessKeys.adjust = { [weak self] id, delta in self?.enqueueKey(id: id, delta: delta) }
+        if keysEnabled { brightnessKeys.start(prompt: CommandLine.arguments.contains("--enable-brightness-keys")) }
         refresh()
     }
     func item(_ title: String, action: Selector? = nil) -> NSMenuItem {
@@ -127,6 +136,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func footer() {
         menu.addItem(.separator())
         menu.addItem(item("Refresh Displays", action: #selector(refresh)))
+        let keys = item(brightnessKeys.running ? "Brightness Keys Follow Cursor" : "Enable Brightness Keys…", action: #selector(toggleKeys))
+        keys.state = brightnessKeys.running ? .on : .off
+        menu.addItem(keys)
+        keyStatusItem = item(brightnessKeys.running ? keyMessage : "Accessibility permission required for key routing")
+        menu.addItem(keyStatusItem!)
         let manual = item("Allow Unverified Brightness Control", action: #selector(toggleManual))
         manual.state = manualMode ? .on : .off
         menu.addItem(manual)
@@ -139,7 +153,70 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         quit.keyEquivalent = "q"
         menu.addItem(quit)
     }
-    func menuWillOpen(_ menu: NSMenu) { refresh() }
+    func menuWillOpen(_ menu: NSMenu) {
+        if keysEnabled { brightnessKeys.start() }
+        refresh()
+    }
+
+    @objc func toggleKeys() {
+        if brightnessKeys.running {
+            brightnessKeys.stop()
+            UserDefaults.standard.set(true, forKey: "brightnessKeysDisabled")
+            keyWork?.cancel(); keyDeltas.removeAll()
+        } else {
+            UserDefaults.standard.set(false, forKey: "brightnessKeysDisabled")
+            brightnessKeys.start(prompt: true)
+            if !brightnessKeys.running {
+                alert("Enable brightness-key routing", "Allow Monitor Brightness in System Settings → Privacy & Security → Accessibility. Then reopen this menu. If macOS also requests Input Monitoring, allow it and relaunch the app.\n\nThis lets the app intercept brightness keys over external monitors while leaving built-in display controls to macOS.")
+                if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility") { NSWorkspace.shared.open(url) }
+            }
+        }
+        refresh()
+    }
+
+    func enqueueKey(id: UInt32, delta: Double) {
+        rows.forEach { $0.invalidate() }
+        keyDeltas[id, default: 0] += delta
+        guard !keyBusy, keyWork == nil else { return }
+        let work = DispatchWorkItem { [weak self] in self?.keyWork = nil; self?.processKey() }
+        keyWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.04, execute: work)
+    }
+
+    func processKey() {
+        guard !keyBusy, let (id, delta) = keyDeltas.first else { return }
+        keyDeltas.removeValue(forKey: id)
+        keyBusy = true
+        let name = NSScreen.screens.first { screenID($0) == id }?.localizedName ?? "External display"
+        queue.async { [weak self] in
+            var handles = [OpaquePointer?](repeating: nil, count: 16)
+            let count = ddc_discover(&handles, Int32(handles.count))
+            let all = handles.prefix(max(0, Int(count))).compactMap { $0 }
+            defer { all.forEach { ddc_release($0) } }
+            let matches = all.filter { ddc_screen_id($0) == id }
+            var message = "\(name): DDC brightness unavailable"
+            if matches.count == 1, let handle = matches.first {
+                var current: UInt16 = 0, maximum: UInt16 = 0
+                if ddc_read(handle, &current, &maximum) {
+                    let target = UInt16(min(Double(maximum), max(0, (Double(current) + delta * Double(maximum) / 100).rounded())))
+                    if ddc_write(handle, target) {
+                        var actual: UInt16 = 0, readMax: UInt16 = 0
+                        if ddc_read(handle, &actual, &readMax) {
+                            message = "\(name): \(Int((Double(actual) / Double(readMax) * 100).rounded()))%"
+                        } else { message = "\(name): sent, not confirmed" }
+                    } else { message = "\(name): brightness write failed" }
+                }
+            }
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                self.keyBusy = false
+                self.keyMessage = message
+                self.keyStatusItem?.title = message
+                self.status.button?.toolTip = message
+                self.processKey()
+            }
+        }
+    }
 
     @objc func refresh() {
         generation += 1
